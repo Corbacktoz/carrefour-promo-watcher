@@ -1,4 +1,4 @@
-import os, re, sys, logging, time
+import os, re, sys, logging, time, asyncio
 from datetime import datetime
 from urllib.parse import urljoin
 from urllib import robotparser
@@ -6,15 +6,15 @@ from urllib import robotparser
 from bs4 import BeautifulSoup
 import requests
 
-from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # === Configuration ===
 PROMO_URLS = [
-    "https://www.carrefour.fr/promotions",         # cible principale (nécessite JS/cookies)
-    "https://www.carrefour.fr/evenements/soldes",  # fallback public
+    "https://www.carrefour.fr/promotions",
+    "https://www.carrefour.fr/evenements/soldes",
 ]
 USER_AGENT = "PromoWatcher/1.0 (+contact: you@example.com)"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -24,13 +24,12 @@ SKIP_ROBOTS = os.getenv("SKIP_ROBOTS", "false").lower() == "true"
 # === Log ===
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# Regex pour détecter les pourcentages
 PCT_RE = re.compile(r"(-?\d{1,3})\s?%")
 
-# === Vérification robots.txt (option SKIP_ROBOTS) ===
+# === Vérification robots.txt ===
 def allowed_by_robots(url: str, user_agent: str = USER_AGENT) -> bool:
     if SKIP_ROBOTS:
-        logging.warning("SKIP_ROBOTS=true → vérification robots.txt désactivée (mode test).")
+        logging.warning("SKIP_ROBOTS=true → vérification robots.txt désactivée.")
         return True
     base = "https://www.carrefour.fr"
     rp = robotparser.RobotFileParser()
@@ -39,13 +38,12 @@ def allowed_by_robots(url: str, user_agent: str = USER_AGENT) -> bool:
         rp.read()
         return rp.can_fetch(user_agent, url)
     except Exception as e:
-        logging.warning("robots.txt illisible (%s). On considère l'accès autorisé (mode permissif).", e)
+        logging.warning("robots.txt illisible (%s). Accès autorisé par défaut.", e)
         return True
 
-# === Extraction des promos depuis HTML ===
+# === Extraction des promos ===
 def extract_promos(html: str):
     soup = BeautifulSoup(html, "html.parser")
-
     text_blobs = [t.strip() for t in soup.find_all(string=True) if t.strip()]
     full_text = " \n".join(text_blobs)
 
@@ -60,125 +58,119 @@ def extract_promos(html: str):
     hits = [v for v in found if abs(v) >= 50]
 
     cards = []
-    for card in soup.select("[class*='card'], [class*='Card'], article, li, [data-testid*='card'], [data-test*='card']"):
+    for card in soup.select("[class*='card'], [class*='Card'], article, li, [data-testid*='card']"):
         snippet = " ".join(card.get_text(separator=" ", strip=True).split())
         if PCT_RE.search(snippet):
             cards.append(snippet[:220])
 
     return sorted(set(hits), reverse=True), cards[:5]
 
-# === Envoi Telegram ===
-def send_telegram(msg: str):
+# === Envoi Telegram (async) ===
+async def send_telegram(msg: str):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        logging.warning("Telegram non configuré (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID manquants).")
+        logging.warning("Telegram non configuré.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True}
     try:
-        requests.post(url, json=payload, timeout=15)
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: requests.post(url, json=payload, timeout=15))
     except Exception as e:
         logging.error("Envoi Telegram échoué: %s", e)
 
-# === Fetch via Playwright (gère cookies/JS) ===
-def fetch_with_playwright(url: str) -> str:
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        ctx = browser.new_context(
+# === Fetch avec Playwright (async) ===
+async def fetch_with_playwright(url: str) -> str:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+        ctx = await browser.new_context(
             user_agent=USER_AGENT,
             locale="fr-FR",
             extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9"},
         )
-        page = ctx.new_page()
+        page = await ctx.new_page()
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # Bannières cookies / consentement : on tente quelques sélecteurs “classiques”
+            # Gestion cookies
             consent_selectors = [
                 "button:has-text('Accepter')",
                 "button:has-text('Tout accepter')",
-                "button:has-text('J’accepte')",
-                "button:has-text('J accepte')",
-                "button:has-text('Continuer sans accepter')",
-                "[aria-label*='accepter']",
+                "button:has-text('J'accepte')",
             ]
             for sel in consent_selectors:
                 try:
-                    page.locator(sel).first.click(timeout=2000)
-                    logging.info("Bannière cookies: bouton cliqué (%s).", sel)
+                    await page.locator(sel).first.click(timeout=2000)
+                    logging.info("Bannière cookies fermée (%s).", sel)
                     break
                 except PWTimeout:
                     pass
-                except Exception:
-                    pass
 
-            # Parfois sélection de magasin : on essaie de fermer un éventuel modal
+            # Fermeture modals
             close_selectors = [
                 "button[aria-label='Fermer']",
                 "button:has-text('Fermer')",
-                "button[aria-label*='Close']",
             ]
             for sel in close_selectors:
                 try:
-                    page.locator(sel).first.click(timeout=1500)
+                    await page.locator(sel).first.click(timeout=1500)
                     logging.info("Modal fermé (%s).", sel)
                     break
                 except PWTimeout:
                     pass
-                except Exception:
-                    pass
 
-            # Laisser charger les blocs promos
-            page.wait_for_load_state("networkidle", timeout=20000)
-            # petite marge
-            time.sleep(1.0)
+            await page.wait_for_load_state("networkidle", timeout=20000)
+            await asyncio.sleep(1.0)
 
-            html = page.content()
+            html = await page.content()
             return html
         finally:
-            ctx.close()
-            browser.close()
+            await ctx.close()
+            await browser.close()
 
-# === Fetch fallback classique (requests) ===
+# === Fetch fallback (requests) ===
 def fetch_requests(url: str) -> str:
     headers = {"User-Agent": USER_AGENT, "Accept-Language": "fr-FR,fr;q=0.9"}
     r = requests.get(url, headers=headers, timeout=20, allow_redirects=True)
     r.raise_for_status()
     return r.text
 
-# === Essaie les URL l’une après l’autre, d’abord Playwright, puis fallback requests ===
-def fetch_first_ok() -> tuple[str, str]:
+# === Essaie toutes les URLs ===
+async def fetch_first_ok() -> tuple[str, str]:
     last_err = None
     for url in PROMO_URLS:
-        # robots check (pour la 1ère surtout)
         if not allowed_by_robots(url):
             logging.warning("Accès refusé par robots.txt pour %s.", url)
             continue
-        # 1) tentative headless
+        
+        # Tentative Playwright
         try:
-            html = fetch_with_playwright(url)
-            logging.info("Fetch OK (Playwright) sur %s", url)
+            html = await fetch_with_playwright(url)
+            logging.info("✓ Fetch OK (Playwright) sur %s", url)
             return url, html
         except Exception as e:
-            logging.warning("Playwright KO sur %s : %s", url, e)
+            logging.warning("✗ Playwright KO sur %s : %s", url, e)
             last_err = e
-        # 2) fallback simple requests (utile sur les pages “HTML classiques”)
+        
+        # Fallback requests
         try:
-            html = fetch_requests(url)
-            logging.info("Fetch OK (requests) sur %s", url)
+            loop = asyncio.get_event_loop()
+            html = await loop.run_in_executor(None, fetch_requests, url)
+            logging.info("✓ Fetch OK (requests) sur %s", url)
             return url, html
         except Exception as e:
-            logging.warning("Requests KO sur %s : %s", url, e)
+            logging.warning("✗ Requests KO sur %s : %s", url, e)
             last_err = e
+    
     raise last_err or RuntimeError("Toutes les URL ont échoué")
 
-# === Tâche principale ===
-def job_once():
-    logging.info("Scan des promotions Carrefour…")
+# === Tâche principale (async) ===
+async def job_once():
+    logging.info("🔍 Scan des promotions Carrefour…")
     try:
-        used_url, html = fetch_first_ok()
+        used_url, html = await fetch_first_ok()
     except Exception as e:
-        logging.error("Erreur téléchargement (toutes URL): %s", e)
-        send_telegram(f"⚠️ Erreur de téléchargement des pages promos: {e}")
+        logging.error("❌ Erreur téléchargement: %s", e)
+        await send_telegram(f"⚠️ Erreur de téléchargement des pages promos: {e}")
         return
 
     hits, cards = extract_promos(html)
@@ -186,37 +178,58 @@ def job_once():
         header = f"🛒 Carrefour : {len(hits)} remise(s) ≥ 50% ({', '.join(str(abs(v))+'%' for v in hits[:5])})"
         body = "\n• " + "\n• ".join(cards) if cards else ""
         msg = f"{header}\n{body}\n\nSource : {used_url}"
-        logging.info("ALERTE envoyée.")
-        send_telegram(msg)
+        logging.info("✅ ALERTE envoyée.")
+        await send_telegram(msg)
     else:
-        msg = f"🕓 {datetime.now():%H:%M} – aucune remise ≥ 50% trouvée (source : {used_url})."
+        msg = f"🕐 {datetime.now():%H:%M} — aucune remise ≥ 50% trouvée (source : {used_url})."
         logging.info(msg)
-        send_telegram(msg)
+        await send_telegram(msg)
 
-# === Commande /now sur Telegram ===
+# === Commande Telegram /now ===
 async def telegram_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logging.info("Commande Telegram /now reçue.")
-    await context.bot.send_message(chat_id=update.effective_chat.id, text="🔎 Vérification manuelle (headless) en cours…")
-    job_once()
+    logging.info("📱 Commande /now reçue.")
+    await context.bot.send_message(chat_id=update.effective_chat.id, text="🔎 Vérification en cours…")
+    await job_once()
 
-# === Boucle principale ===
-def main():
-    if len(sys.argv) > 1 and sys.argv[1].lower() == "now":
-        job_once()
-        return
-
-    scheduler = BlockingScheduler(timezone="Europe/Paris")
+# === Main avec scheduler + Telegram ===
+async def main_async():
+    # Configuration du scheduler
+    scheduler = AsyncIOScheduler(timezone="Europe/Paris")
     scheduler.add_job(job_once, "cron", hour=9, minute=5, id="daily_check")
-    logging.info("Planifié chaque jour à 09:05 Europe/Paris.")
+    scheduler.start()
+    logging.info("⏰ Planifié chaque jour à 09:05 Europe/Paris.")
 
     if TELEGRAM_BOT_TOKEN:
+        # Configuration du bot Telegram
         app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
         app.add_handler(CommandHandler("now", telegram_now))
-        logging.info("Commande Telegram /now disponible.")
-        app.run_polling()
+        
+        # Initialise le bot et commence le polling
+        await app.initialize()
+        await app.start()
+        logging.info("🤖 Bot Telegram démarré avec commande /now")
+        
+        # Garde le programme en vie
+        try:
+            await app.updater.start_polling()
+            # Attendre indéfiniment
+            await asyncio.Event().wait()
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
     else:
-        logging.warning("Aucun token Telegram -> mode console seul.")
-        scheduler.start()
+        logging.warning("⚠️ Pas de token Telegram -> mode console seul.")
+        # Garde le scheduler en vie
+        await asyncio.Event().wait()
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1].lower() == "now":
+        asyncio.run(job_once())
+        return
+
+    # Lance la boucle principale
+    asyncio.run(main_async())
 
 if __name__ == "__main__":
     main()
