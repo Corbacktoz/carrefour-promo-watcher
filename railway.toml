@@ -1,0 +1,5 @@
+[service]
+name = "carrefour-promo-watcher"
+start = "python promo_watcher.py"
+[variables]
+TZ = "Europe/Paris"

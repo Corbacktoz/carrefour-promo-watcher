@@ -1,0 +1,4 @@
+requests
+beautifulsoup4
+apscheduler
+python-telegram-bot==21.*
