@@ -30,7 +30,7 @@ def allowed_by_robots(url: str, user_agent: str = USER_AGENT) -> bool:
         return rp.can_fetch(user_agent, url)
     except Exception as e:
         logging.warning("robots.txt illisible (%s), prudence.", e)
-        return False
+        return True
 
 # === Téléchargement page promotions ===
 def fetch_promotions() -> str:
