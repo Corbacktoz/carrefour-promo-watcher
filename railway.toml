@@ -1,5 +1,6 @@
 [service]
 name = "carrefour-promo-watcher"
-start = "python promo_watcher.py"
+# installe le navigateur + dépendances avant de lancer le worker
+start = "python -m playwright install --with-deps chromium && python promo_watcher_headless.py"
 [variables]
 TZ = "Europe/Paris"
