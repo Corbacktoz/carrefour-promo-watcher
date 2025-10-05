@@ -2,6 +2,7 @@ import os, re, sys, logging, time, asyncio
 from datetime import datetime
 from urllib.parse import urljoin
 from urllib import robotparser
+from typing import Tuple
 
 from bs4 import BeautifulSoup
 import requests
@@ -16,7 +17,7 @@ PROMO_URLS = [
     "https://www.carrefour.fr/promotions",
     "https://www.carrefour.fr/evenements/soldes",
 ]
-USER_AGENT = "PromoWatcher/1.0 (+contact: you@example.com)"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 SKIP_ROBOTS = os.getenv("SKIP_ROBOTS", "false").lower() == "true"
@@ -81,12 +82,33 @@ async def send_telegram(msg: str):
 # === Fetch avec Playwright (async) ===
 async def fetch_with_playwright(url: str) -> str:
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=['--no-sandbox', '--disable-dev-shm-usage'])
+        browser = await p.chromium.launch(
+            headless=True, 
+            args=[
+                '--no-sandbox', 
+                '--disable-dev-shm-usage',
+                '--disable-blink-features=AutomationControlled'
+            ]
+        )
         ctx = await browser.new_context(
             user_agent=USER_AGENT,
             locale="fr-FR",
-            extra_http_headers={"Accept-Language": "fr-FR,fr;q=0.9"},
+            viewport={'width': 1920, 'height': 1080},
+            extra_http_headers={
+                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Connection": "keep-alive",
+                "Upgrade-Insecure-Requests": "1",
+            },
         )
+        
+        # Masquer les traces de Playwright
+        await ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            window.chrome = {runtime: {}};
+        """)
+        
         page = await ctx.new_page()
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -119,7 +141,7 @@ async def fetch_with_playwright(url: str) -> str:
                     pass
 
             await page.wait_for_load_state("networkidle", timeout=20000)
-            await asyncio.sleep(1.0)
+            await asyncio.sleep(2.0)  # Temps supplémentaire pour chargement dynamique
 
             html = await page.content()
             return html
@@ -135,7 +157,7 @@ def fetch_requests(url: str) -> str:
     return r.text
 
 # === Essaie toutes les URLs ===
-async def fetch_first_ok() -> tuple[str, str]:
+async def fetch_first_ok() -> Tuple[str, str]:
     last_err = None
     for url in PROMO_URLS:
         if not allowed_by_robots(url):
