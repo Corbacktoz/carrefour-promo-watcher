@@ -1,5 +1,5 @@
-# Utilise une image avec Playwright préinstallé
-FROM mcr.microsoft.com/playwright/python:v1.40.0-focal
+# Utilise une image avec Playwright préinstallé (Python 3.11)
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
 WORKDIR /app
 
