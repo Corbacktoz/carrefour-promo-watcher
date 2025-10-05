@@ -14,14 +14,21 @@ USER_AGENT = "PromoWatcher/1.0 (+contact: you@example.com)"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
+# 🔧 Option de test: ignorer robots.txt si SKIP_ROBOTS=true (ex: dans Railway Variables)
+SKIP_ROBOTS = os.getenv("SKIP_ROBOTS", "false").lower() == "true"
+
 # === Log ===
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # Regex pour détecter les pourcentages
 PCT_RE = re.compile(r"(-?\d{1,3})\s?%")
 
-# === Vérification robots.txt ===
+# === Vérification robots.txt (avec option SKIP_ROBOTS) ===
 def allowed_by_robots(url: str, user_agent: str = USER_AGENT) -> bool:
+    if SKIP_ROBOTS:
+        logging.warning("SKIP_ROBOTS=true → vérification robots.txt désactivée (mode test).")
+        return True
+
     base = "https://www.carrefour.fr"
     rp = robotparser.RobotFileParser()
     rp.set_url(urljoin(base, "/robots.txt"))
@@ -29,7 +36,8 @@ def allowed_by_robots(url: str, user_agent: str = USER_AGENT) -> bool:
         rp.read()
         return rp.can_fetch(user_agent, url)
     except Exception as e:
-        logging.warning("robots.txt illisible (%s), prudence.", e)
+        # Fail-open pour les cas où robots.txt est illisible (réseau/parse) afin d'éviter les faux négatifs.
+        logging.warning("robots.txt illisible (%s). On considère l'accès autorisé (mode permissif).", e)
         return True
 
 # === Téléchargement page promotions ===
@@ -42,6 +50,7 @@ def fetch_promotions() -> str:
 # === Extraction des promos ===
 def extract_promos(html: str):
     soup = BeautifulSoup(html, "html.parser")
+
     text_blobs = [t.strip() for t in soup.find_all(string=True) if t.strip()]
     full_text = " \n".join(text_blobs)
 
@@ -54,17 +63,20 @@ def extract_promos(html: str):
             continue
 
     hits = [v for v in found if abs(v) >= 50]
+
+    # Essai de snippets lisibles (cartes)
     cards = []
     for card in soup.select("[class*='card'], [class*='Card'], article, li"):
         snippet = " ".join(card.get_text(separator=" ", strip=True).split())
         if PCT_RE.search(snippet):
             cards.append(snippet[:220])
+
     return sorted(set(hits), reverse=True), cards[:5]
 
 # === Envoi Telegram ===
 def send_telegram(msg: str):
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
-        logging.warning("Telegram non configuré.")
+        logging.warning("Telegram non configuré (TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID manquants).")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "disable_web_page_preview": True}
@@ -76,13 +88,18 @@ def send_telegram(msg: str):
 # === Tâche principale ===
 def job_once():
     logging.info("Scan des promotions Carrefour…")
+
     if not allowed_by_robots(PROMO_URL):
-        logging.warning("Accès non autorisé par robots.txt pour %s.", PROMO_URL)
+        warn = f"⚠️ Accès refusé par robots.txt pour {PROMO_URL}."
+        logging.warning(warn)
+        send_telegram(warn)
         return
+
     try:
         html = fetch_promotions()
     except Exception as e:
         logging.error("Erreur téléchargement: %s", e)
+        send_telegram(f"⚠️ Erreur de téléchargement de la page promotions: {e}")
         return
 
     hits, cards = extract_promos(html)
