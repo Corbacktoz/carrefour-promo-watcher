@@ -14,8 +14,8 @@ from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 # === Configuration ===
 PROMO_URLS = [
-    "https://www.auchan.fr/nos-offres",
-    "https://www.leclerc.com/cat-mag-promo",
+    "https://www.auchan.fr/catalogue/",
+    "https://www.e.leclerc/prospectus",
 ]
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -117,7 +117,9 @@ async def fetch_with_playwright(url: str) -> str:
             consent_selectors = [
                 "button:has-text('Accepter')",
                 "button:has-text('Tout accepter')",
-                "button:has-text('J'accepte')",
+                "button:text('Accepter')",
+                "button:text('J accepte')",
+                "[aria-label*='accepter']",
             ]
             for sel in consent_selectors:
                 try:
@@ -197,7 +199,7 @@ async def job_once():
 
     hits, cards = extract_promos(html)
     if hits:
-        header = f"🛒 Carrefour : {len(hits)} remise(s) ≥ 50% ({', '.join(str(abs(v))+'%' for v in hits[:5])})"
+        header = f"🛒 Promos : {len(hits)} remise(s) ≥ 50% ({', '.join(str(abs(v))+'%' for v in hits[:5])})"
         body = "\n• " + "\n• ".join(cards) if cards else ""
         msg = f"{header}\n{body}\n\nSource : {used_url}"
         logging.info("✅ ALERTE envoyée.")
